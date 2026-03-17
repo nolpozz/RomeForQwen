@@ -19,25 +19,47 @@ import modal
 
 app = modal.App("rome-final-eval")
 
-MOUNT_PATH = "/workspace" 
-EASYEDIT_COMMIT = "41937637c2171b9cf1f929c143231d45a79f7787"
-
-def get_modal_mounts():
-    return [modal.Mount.from_local_dir(".", remote_path=MOUNT_PATH)]
+PROJECT_ROOT = Path(__file__).resolve().parent
+EASYEDIT_SRC = PROJECT_ROOT.parent / "EasyEdit"
+COUNTERFACT_REVISION = "c01c413f856ee38f5c080c9fc5e87aff478e2ff9"
 
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git")
+    .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0")
     .pip_install(
+        "huggingface_hub>=0.34.0,<1.0",
+        "higher",
+        "einops",
+        "gpustat",
+        "hydra-core",
+        "importlib-metadata",
+        "matplotlib",
+        "nltk",
+        "omegaconf",
+        "scikit-learn",
+        "scipy",
+        "sentence-transformers",
+        "openai",
+        "peft",
+        "timm",
+        "iopath",
+        "opencv-python",
+        "av",
+        "qwen_vl_utils",
+        "zhipuai",
+        "sentencepiece",
+        "rouge",
         "torch",
-        "transformers",
-        "datasets",
-        "accelerate",
+        "transformers==4.40.2",
+        "datasets>=2.14.0",
+        "accelerate==0.21.0",
         "pandas",
         "pyyaml",
         "tqdm",
-        f"git+https://github.com/zjunlp/EasyEdit.git@{EASYEDIT_COMMIT}",
+        "fairscale",
     )
+    .add_local_dir(str(EASYEDIT_SRC), "/root/EasyEdit")
+    .add_local_dir(str(PROJECT_ROOT), "/root/project")
 )
 
 # -----------------------------------------------------------------------------
@@ -46,8 +68,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(),
-    mounts=get_modal_mounts(),
+    gpu="A100-40GB",
     timeout=86400,
 )
 def run_rome_final_eval() -> tuple[list[dict], dict]:
@@ -55,9 +76,11 @@ def run_rome_final_eval() -> tuple[list[dict], dict]:
     Build holdout = known_indices \\ tuning_indices, run ROME with best params,
     return per-edit metrics and aggregate (with n_efficacy, n_generalization, n_locality).
     """
-    from pathlib import Path
+    project_dir = Path("/root/project")
+    easyedit_dir = Path("/root/EasyEdit")
+    sys.path.insert(0, str(easyedit_dir))
+    sys.path.insert(0, str(project_dir))
     from easyeditor import ROMEHyperParams, BaseEditor
-    sys.path.insert(0, MOUNT_PATH)
     import rome_utils
 
     rome_utils.set_seeds(16)
@@ -68,9 +91,8 @@ def run_rome_final_eval() -> tuple[list[dict], dict]:
     BEST_V_STEPS = 30
     # ------------------------------------------------------------------------------------------
 
-    workspace = Path(MOUNT_PATH)
-    with open(workspace / "qwen_known_indices.json", "r") as f:
-        known_indices = set(int(i) for i in json.load(f))
+    workspace = project_dir
+    known_indices = set(rome_utils.load_indices_file(str(workspace / "qwen_known_indices.json")))
     with open(workspace / "tuning_indices_used.json", "r") as f:
         tuning_indices = set(int(i) for i in json.load(f))
 
@@ -80,17 +102,15 @@ def run_rome_final_eval() -> tuple[list[dict], dict]:
 
     holdout_indices = sorted(set(known_indices) - set(tuning_indices))
 
-    data_path = workspace / "data" / "counterfact" / "counterfact-train.json"
-    if not data_path.exists():
-        data_path = workspace / "counterfact-train.json"
-    if not data_path.exists():
-        raise FileNotFoundError(
-            "CounterFact data not found. Place counterfact-train.json at "
-            "data/counterfact/counterfact-train.json or counterfact-train.json in repo root."
-        )
-    data_path = str(data_path)
-
-    records = rome_utils.load_and_filter_dataset(holdout_indices, data_path)
+    dataset_records = rome_utils.download_counterfact_dataset(
+        split="test",
+        revision=COUNTERFACT_REVISION,
+    )
+    records = rome_utils.load_and_filter_dataset(
+        holdout_indices,
+        dataset_records=dataset_records,
+        id_field="case_id",
+    )
     requests = [rome_utils.record_to_request(r) for r in records]
 
     base_config = {

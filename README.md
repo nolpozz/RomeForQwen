@@ -23,8 +23,8 @@ A **reproducible two-phase evaluation pipeline** for [ROME](https://github.com/n
    - [Modal](https://modal.com): `pip install modal` then `modal token new`
 
 2. **Inputs** (in repo root)
-   - **`qwen_known_indices.json`** — JSON array of integer indices into your CounterFact dataset (at least 150 valid indices).
-   - **CounterFact data** — `data/counterfact/counterfact-train.json` or `counterfact-train.json` in repo root (same format as EasyEdit’s CounterFact; see [WORKFLOW.md](WORKFLOW.md)).
+   - **`qwen_known_indices.json`** — either a JSON array of integers or a JSON object containing `case_ids`. Integers are treated as CounterFact `case_id` values.
+   - **No local CounterFact file required** — dataset is downloaded from Hugging Face `azhx/counterfact` (split `test`) at a pinned revision.
 
 3. **Phase 1 — Grid search**
    ```bash
@@ -45,8 +45,8 @@ A **reproducible two-phase evaluation pipeline** for [ROME](https://github.com/n
 ## Reproducibility
 
 - **Random seed:** 16 (in `rome_utils.set_seeds(16)`).
-- **EasyEdit:** Pinned to commit `41937637c2171b9cf1f929c143231d45a79f7787` in both Modal scripts (`EASYEDIT_COMMIT`). Change only when intentionally upgrading.
-- **Data:** One canonical CounterFact JSON path for both phases; no HuggingFace fallback to avoid dataset drift.
+- **EasyEdit:** Installed as PyPI package `easyeditor==0.0.1` in both Modal scripts.
+- **Data:** CounterFact is downloaded from `azhx/counterfact` at a pinned dataset revision (`COUNTERFACT_REVISION`) in both scripts to prevent drift.
 
 ---
 

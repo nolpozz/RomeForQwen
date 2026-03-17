@@ -10,6 +10,29 @@ from typing import Any
 import numpy as np
 
 
+def _coerce_text(x: Any) -> str:
+    """
+    Robustly coerce various CounterFact field variants into plain text.
+    Handles strings, lists, dicts, and falls back to str(x).
+    """
+    if isinstance(x, str):
+        return x
+    if isinstance(x, (list, tuple)):
+        for v in x:
+            if v:
+                return _coerce_text(v)
+        return ""
+    if isinstance(x, dict):
+        for key in ("str", "text", "value"):
+            if key in x and x[key]:
+                return _coerce_text(x[key])
+        for v in x.values():
+            if v:
+                return _coerce_text(v)
+        return ""
+    return str(x)
+
+
 def set_seeds(seed: int = 16) -> None:
     """Set explicit seeds for torch, numpy, and random to guarantee reproducibility."""
     random.seed(seed)
@@ -26,18 +49,55 @@ def set_seeds(seed: int = 16) -> None:
         pass
 
 
-def load_and_filter_dataset(indices_to_keep: list[int], data_path: str) -> list[dict]:
+def download_counterfact_dataset(
+    *,
+    split: str = "test",
+    revision: str = "c01c413f856ee38f5c080c9fc5e87aff478e2ff9",
+) -> list[dict]:
     """
-    Load the CounterFact dataset via EasyEdit and filter to the given indices.
-    Preserves order of indices_to_keep. Only indices in valid range [0, len(data)) are kept.
-    Prevents dataset order/length drift by using a single canonical data path.
+    Download CounterFact from HuggingFace (`azhx/counterfact`) with a pinned revision.
+
+    This is the canonical data source used by the Modal scripts to avoid local file drift.
+    The pinned `revision` must be an immutable commit hash.
     """
-    from easyeditor import CounterFactDataset
-    dataset = CounterFactDataset(data_path)
-    data = dataset.data
-    n = len(data)
+    from datasets import load_dataset
+
+    ds = load_dataset("azhx/counterfact", split=split, revision=revision)
+    return [dict(r) for r in ds]
+
+
+def load_and_filter_dataset(
+    indices_to_keep: list[int],
+    *,
+    dataset_records: list[dict],
+    id_field: str = "case_id",
+) -> list[dict]:
+    """
+    Filter CounterFact records to match `indices_to_keep` exactly.
+
+    - If `id_field` exists in records, treats `indices_to_keep` as *IDs* (e.g. case_id) and returns
+      records in the order of `indices_to_keep` (dropping IDs not present).
+    - Otherwise, treats `indices_to_keep` as *positional indices* into `dataset_records` (dropping out-of-range).
+
+    This prevents dataset order/length drift because selection is done explicitly rather than by
+    relying on implicit ordering across different dataset sources.
+    """
+    if not dataset_records:
+        return []
+
+    if isinstance(dataset_records[0], dict) and id_field in dataset_records[0]:
+        by_id: dict[int, dict] = {}
+        for r in dataset_records:
+            try:
+                rid = int(r.get(id_field))
+            except Exception:
+                continue
+            by_id[rid] = r
+        return [by_id[i] for i in indices_to_keep if i in by_id]
+
+    n = len(dataset_records)
     valid = [i for i in indices_to_keep if 0 <= i < n]
-    return [data[i] for i in valid]
+    return [dataset_records[i] for i in valid]
 
 
 def _get_all_acc_keys(dict_list: list[dict]) -> set:
@@ -114,17 +174,48 @@ def calculate_composite_score(
 
 
 def record_to_request(record: dict) -> dict:
-    """Convert a CounterFact-style record to EasyEdit editor request format (with locality dict)."""
-    prompt = record["prompt"]
-    target_new = record["target_new"]
-    ground_truth = record["ground_truth"]
+    """Convert a CounterFact-style record to EasyEdit editor request format (with locality dict).
+
+    This function is robust to slight schema differences between CounterFact
+    dumps. It prefers top-level `prompt` / `target_new` / `ground_truth`
+    fields, but will fall back to common nested structures (e.g. the
+    `requested_rewrite` dict used in some variants) when those are absent.
+    """
+    # Primary, flat schema
+    prompt = record.get("prompt")
+    target_new = record.get("target_new")
+    ground_truth = record.get("ground_truth")
+
+    # Fallback: nested requested_rewrite-style schema
+    rw = record.get("requested_rewrite") or record.get("edit", {}).get("requested_rewrite")
+    if rw and isinstance(rw, dict):
+        if prompt is None:
+            prompt = rw.get("prompt")
+        if target_new is None:
+            target_new = rw.get("target_new")
+        if ground_truth is None:
+            ground_truth = rw.get("ground_truth") or rw.get("target_true")
+
+    if prompt is None or target_new is None:
+        raise KeyError(
+            f"record_to_request could not find prompt/target_new in record: keys={list(record.keys())}"
+        )
+    prompt = _coerce_text(prompt)
+    target_new = _coerce_text(target_new)
+    if ground_truth is None:
+        # As a last resort, treat empty ground truth as end-of-text.
+        ground_truth = "<|endoftext|>"
+    else:
+        ground_truth = _coerce_text(ground_truth)
     subject = record.get("subject")
     if not subject:
-        if "," in prompt:
-            subject = prompt.split(",")[0].strip()
+        if "," in str(prompt):
+            subject = str(prompt).split(",")[0].strip()
         else:
-            words = prompt.split()[:2]
+            words = str(prompt).split()[:2]
             subject = " ".join(words) if words else "unknown"
+    else:
+        subject = _coerce_text(subject)
     rephrase = record.get("rephrase_prompt")
     loc_prompt = record.get("locality_prompt")
     loc_ground = record.get("locality_ground_truth")
@@ -142,3 +233,28 @@ def record_to_request(record: dict) -> dict:
     if rephrase is not None:
         req["rephrase_prompt"] = rephrase
     return req
+
+
+def load_indices_file(path: str) -> list[int]:
+    """
+    Load an indices JSON file.
+
+    Supported formats:
+    - A JSON list of integers: [1, 2, 3, ...]
+    - A JSON object containing 'case_ids': {"case_ids": [1, 2, ...], ...}
+    """
+    import json
+
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    if isinstance(data, list):
+        return [int(i) for i in data]
+
+    if isinstance(data, dict):
+        if "case_ids" in data and isinstance(data["case_ids"], list):
+            return [int(i) for i in data["case_ids"]]
+        if "indices" in data and isinstance(data["indices"], list):
+            return [int(i) for i in data["indices"]]
+
+    raise ValueError(f"Unsupported indices file format at {path}")

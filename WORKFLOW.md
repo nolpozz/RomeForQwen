@@ -26,8 +26,8 @@ Shared logic (seeds, dataset loading, metrics, composite score) lives in **`rome
 ## Reproducibility
 
 - **Seed:** All randomness uses seed **16** (set in `rome_utils.set_seeds(16)`).
-- **EasyEdit:** Pinned to commit `41937637c2171b9cf1f929c143231d45a79f7787` in both Modal scripts to prevent repo drift. Update the `EASYEDIT_COMMIT` constant when intentionally upgrading.
-- **Data:** The same CounterFact JSON file must be used in both phases (see below). No HuggingFace fallback—dataset path is required to avoid order/length drift.
+- **EasyEdit:** Installed as PyPI package **`easyeditor==0.0.1.dev0`** in both Modal scripts (this is the version exposed on Modal's internal mirror).
+- **Data:** CounterFact is loaded from Hugging Face dataset **`azhx/counterfact`** with a pinned dataset revision (`COUNTERFACT_REVISION`) in both scripts to prevent dataset drift.
 
 ---
 
@@ -36,7 +36,10 @@ Shared logic (seeds, dataset loading, metrics, composite score) lives in **`rome
 ### 1. `qwen_known_indices.json`
 
 - **Location:** Repo root (`RomeForQwen/qwen_known_indices.json`).
-- **Format:** JSON array of integers: indices into the CounterFact dataset that the model “knows.”
+- **Format:** Either:
+  - JSON array of integers, or
+  - JSON object containing a `case_ids` list (supported; matches your uploaded file).
+- **Semantics:** Integers are treated as **CounterFact `case_id` values** (preferred). If the dataset does not contain a `case_id` field, they are treated as positional indices.
 - **Constraint:** After deduplication and range checks, at least **150** indices must remain (for the Phase 1 sample).
 
 Example:
@@ -45,13 +48,12 @@ Example:
 [0, 1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100, 200, 300, 400, 500, ...]
 ```
 
-### 2. CounterFact dataset (required)
+### 2. CounterFact dataset source (automatic)
 
-- **Location:** One of:
-  - `RomeForQwen/data/counterfact/counterfact-train.json`
-  - `RomeForQwen/counterfact-train.json`
-- **Format:** JSON **list** of CounterFact-style records (fields: `prompt`, `target_new`, `ground_truth`, `subject`, `rephrase_prompt`, `locality_prompt`, `locality_ground_truth`).
-- **Important:** The same file is used in Phase 1 and Phase 2 so that indices in `qwen_known_indices.json` and `tuning_indices_used.json` refer to the same dataset. There is no HuggingFace fallback.
+- **Dataset:** `azhx/counterfact` (Hugging Face Datasets).
+- **Split:** `test` (21,919 rows).
+- **Pinned revision:** `COUNTERFACT_REVISION = c01c413f856ee38f5c080c9fc5e87aff478e2ff9` in both scripts.
+- **Requirement:** The Modal container must be able to reach Hugging Face to download dataset artifacts.
 
 ---
 
@@ -62,9 +64,10 @@ Example:
 ### What it does
 
 1. Calls `rome_utils.set_seeds(16)`.
-2. Loads `qwen_known_indices.json` and resolves the CounterFact data path (errors if not found).
-3. Deduplicates known indices and restricts to valid range; uses **seeded** `random.sample` to pick **150** tuning indices; these are returned and saved locally as `tuning_indices_used.json`.
-4. Loads the dataset via `rome_utils.load_and_filter_dataset(tuning_indices_used, data_path)` and builds editor requests with `rome_utils.record_to_request`.
+2. Loads `qwen_known_indices.json` (supports list or dict-with-`case_ids`).
+3. Downloads `azhx/counterfact` (split `test`) at pinned `COUNTERFACT_REVISION`.
+4. Deduplicates and validates known IDs against the dataset; uses **seeded** `random.sample` to pick **150** tuning IDs; saves them locally as `tuning_indices_used.json`.
+5. Filters the downloaded dataset via `rome_utils.load_and_filter_dataset(tuning_indices_used, dataset_records=...)` and builds editor requests with `rome_utils.record_to_request`.
 5. Runs a grid over **layers** ∈ {15, 20, 24, 27}, **v_lr** ∈ {5e-1, 1e-1, 5e-2}, **v_num_grad_steps** ∈ {20, 30, 40} (108 configs). For each config, ROME uses `rewrite_module_tmp: "model.layers.{}.mlp.down_proj"` (Qwen SwiGLU).
 6. Aggregates metrics with `rome_utils.extract_metrics()` (Efficacy, Generalization, Locality, and **n_efficacy**, **n_generalization**, **n_locality**) and computes the **composite score** with `rome_utils.calculate_composite_score()` (harmonic mean of the three metrics).
 
@@ -94,7 +97,8 @@ modal run run_rome_grid.py
 2. Loads `qwen_known_indices.json` and **`tuning_indices_used.json`** (from Phase 1).
 3. **Validation:** Asserts `set(tuning_indices).issubset(set(known_indices))` — integrity check that tuning indices are a subset of known indices.
 4. Computes **holdout set:** `holdout_indices = sorted(set(known_indices) - set(tuning_indices))`.
-5. Loads records with `rome_utils.load_and_filter_dataset(holdout_indices, data_path)` and runs ROME with the **best** hyperparameters (set at top of the remote function).
+5. Downloads `azhx/counterfact` (split `test`) at pinned `COUNTERFACT_REVISION`.
+6. Loads records with `rome_utils.load_and_filter_dataset(holdout_indices, dataset_records=...)` and runs ROME with the **best** hyperparameters (set at top of the remote function).
 6. Aggregates with `rome_utils.extract_metrics()`; returns per-edit metrics and a summary including **n_efficacy**, **n_generalization**, **n_locality**.
 
 ### Set best hyperparameters
@@ -133,10 +137,12 @@ The local entrypoint also **prints** Efficacy, Generalization, and Locality with
 | Function | Description |
 |----------|-------------|
 | **`set_seeds(seed=16)`** | Sets `random`, `numpy`, and `torch` (including CUDA/cuDNN) for reproducibility. |
-| **`load_and_filter_dataset(indices_to_keep, data_path)`** | Loads EasyEdit `CounterFactDataset(data_path)`, filters to `indices_to_keep` (valid range only), returns list of records in order of `indices_to_keep`. Prevents dataset drift by using a single canonical path. |
+| **`download_counterfact_dataset(split=\"test\", revision=...)`** | Downloads `azhx/counterfact` at a pinned revision and returns a list of records. |
+| **`load_and_filter_dataset(indices_to_keep, dataset_records=..., id_field=\"case_id\")`** | Filters records to match provided IDs (`case_id`) or positional indices if no ID field exists; returns in the order of `indices_to_keep`. |
 | **`extract_metrics(metrics_list)`** | Parses EasyEdit per-edit output. Returns mean **Efficacy**, **Generalization**, **Locality** and sample sizes **n_efficacy**, **n_generalization**, **n_locality** (some records lack paraphrase/locality prompts). |
 | **`calculate_composite_score(efficacy, generalization, locality)`** | Harmonic mean `3 / (1/e + 1/g + 1/l)`. Used for objective hyperparameter selection. Returns `None` if any metric is missing or non-positive. |
 | **`record_to_request(record)`** | Converts a CounterFact-style record to EasyEdit editor request format (including locality dict). |
+| **`load_indices_file(path)`** | Loads indices from either a list-of-ints JSON or a dict containing `case_ids`. |
 
 ---
 
@@ -146,7 +152,7 @@ The local entrypoint also **prints** Efficacy, Generalization, and Locality with
 ┌─────────────────────────────────────────────────────────────────┐
 │  RomeForQwen (repo root)                                         │
 │  ├── qwen_known_indices.json   (required)                        │
-│  ├── data/counterfact/counterfact-train.json  (required)         │
+│  ├── (no local CounterFact file required; downloaded via HF)     │
 │  ├── rome_utils.py              (shared logic)                    │
 │  ├── run_rome_grid.py           (Phase 1)                          │
 │  ├── run_rome_final_eval.py     (Phase 2)                          │
@@ -198,5 +204,5 @@ The local entrypoint also **prints** Efficacy, Generalization, and Locality with
 
 - **Phase 1:** Grid search on 150 tuning samples → `tuning_indices_used.json` + `rome_tuning_results.csv` (use **composite_score** to pick best).
 - **Phase 2:** Holdout evaluation with best params → `rome_final_baseline_metrics.csv` (with **N** row for metric sample sizes).
-- **Reproducibility:** Seed 16; EasyEdit pinned to commit `41937637c2171b9cf1f929c143231d45a79f7787`; single CounterFact data path for both phases.
+- **Reproducibility:** Seed 16; EasyEdit pinned to commit `41937637c2171b9cf1f929c143231d45a79f7787`; CounterFact pinned to HF revision `c01c413f856ee38f5c080c9fc5e87aff478e2ff9`.
 - **Integrity:** Phase 2 asserts tuning ⊆ known; holdout is strictly disjoint from tuning.
