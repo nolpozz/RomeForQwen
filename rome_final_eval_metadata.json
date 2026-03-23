@@ -1,0 +1,31 @@
+{
+  "phase": "final_eval",
+  "seed": 16,
+  "dataset": {
+    "name": "azhx/counterfact",
+    "split": "test",
+    "revision": "c01c413f856ee38f5c080c9fc5e87aff478e2ff9"
+  },
+  "model_name": "Qwen/Qwen2.5-7B",
+  "algorithm": "ROME",
+  "best_hparams": {
+    "layers": 15,
+    "v_lr": 0.1,
+    "v_num_grad_steps": 40
+  },
+  "n_known": 618,
+  "n_tuning": 150,
+  "n_holdout": 468,
+  "summary": {
+    "Efficacy": 1.0,
+    "Generalization": 0.7275641025641025,
+    "Locality": 0.7655982905982905,
+    "Portability": null,
+    "composite_score": 0.8150806538087791,
+    "n_efficacy": 468,
+    "n_generalization": 468,
+    "n_locality": 468,
+    "n_portability": 0,
+    "n_holdout": 468
+  }
+}

@@ -8,8 +8,11 @@ This document describes the full **two-phase evaluation pipeline** for [ROME](ht
 
 | Phase | Script | Purpose |
 |-------|--------|---------|
-| **1** | `run_rome_grid.py` | Hyperparameter grid search on 150 seeded tuning samples; outputs `tuning_indices_used.json` and `rome_tuning_results.csv` (with **composite score** for objective selection). |
-| **2** | `run_rome_final_eval.py` | Definitive baseline evaluation on the **holdout set** (known indices minus tuning indices); outputs `rome_final_baseline_metrics.csv` with per-edit metrics, means, and **N counts** for each metric. |
+| **1** | `run_rome_grid.py` | Hyperparameter grid search on 150 seeded tuning samples; writes `tuning_indices_used.json` and `rome_tuning_results.csv` to a **cloud Volume** (persists if laptop disconnects). |
+| **2** | `run_rome_final_eval.py` | Definitive baseline evaluation on the **holdout set**; reads tuning indices from the Volume, writes `rome_final_baseline_metrics.csv` to the Volume. |
+| **Pull** | `pull_rome_results.py` | Downloads all result files from the cloud Volume to your local directory. Run anytime after Phase 1 or 2 completes (or if you disconnected). |
+
+**Cloud storage:** Results are written to a Modal Volume (`rome-results`) so runs complete and persist even if your laptop disconnects. Pull results locally with `modal run pull_rome_results.py`.
 
 Shared logic (seeds, dataset loading, metrics, composite score) lives in **`rome_utils.py`** so both phases stay consistent.
 
@@ -26,8 +29,9 @@ Shared logic (seeds, dataset loading, metrics, composite score) lives in **`rome
 ## Reproducibility
 
 - **Seed:** All randomness uses seed **16** (set in `rome_utils.set_seeds(16)`).
-- **EasyEdit:** Installed as PyPI package **`easyeditor==0.0.1.dev0`** in both Modal scripts (this is the version exposed on Modal's internal mirror).
+- **EasyEdit:** Both Modal scripts use `add_local_dir(EasyEdit)` to bundle the **local** EasyEdit source from the workspace. The workspace `EasyEdit/` must include the Generalization broadcast fix in `easyeditor/evaluate/evaluate.py`.
 - **Data:** CounterFact is loaded from Hugging Face dataset **`azhx/counterfact`** with a pinned dataset revision (`COUNTERFACT_REVISION`) in both scripts to prevent dataset drift.
+- **Generalization metric:** EasyEdit’s `evaluate.py` is patched to broadcast a single target to multiple rephrase prompts. Without this fix, `zip(prompts, "Antarctica")` yields character pairs and Generalization ≈ 0. Both Modal scripts verify the fix at startup and fail fast if it is missing.
 
 ---
 
@@ -67,23 +71,24 @@ Example:
 2. Loads `qwen_known_indices.json` (supports list or dict-with-`case_ids`).
 3. Downloads `azhx/counterfact` (split `test`) at pinned `COUNTERFACT_REVISION`.
 4. Deduplicates and validates known IDs against the dataset; uses **seeded** `random.sample` to pick **150** tuning IDs; saves them locally as `tuning_indices_used.json`.
-5. Filters the downloaded dataset via `rome_utils.load_and_filter_dataset(tuning_indices_used, dataset_records=...)` and builds editor requests with `rome_utils.record_to_request`.
-5. Runs a grid over **layers** ∈ {15, 20, 24, 27}, **v_lr** ∈ {5e-1, 1e-1, 5e-2}, **v_num_grad_steps** ∈ {20, 30, 40} (108 configs). For each config, ROME uses `rewrite_module_tmp: "model.layers.{}.mlp.down_proj"` (Qwen SwiGLU).
+5. Filters the downloaded dataset via `rome_utils.load_and_filter_dataset(tuning_indices_used, dataset_records=...)` and builds editor requests with `rome_utils.record_to_request` (uses **all** `paraphrase_prompts` and **all** `neighborhood_prompts` per record for more robust Generalization/Locality).
+5. Runs a grid over **layers** ∈ {15, 20, 24, 27}, **v_lr** ∈ {5e-1, 1e-1, 5e-2}, **v_num_grad_steps** ∈ {20, 30, 40} (36 configs). For each config, ROME uses `rewrite_module_tmp: "model.layers.{}.mlp.down_proj"` (Qwen SwiGLU).
 6. Aggregates metrics with `rome_utils.extract_metrics()` (Efficacy, Generalization, Locality, and **n_efficacy**, **n_generalization**, **n_locality**) and computes the **composite score** with `rome_utils.calculate_composite_score()` (harmonic mean of the three metrics).
 
 ### Run
 
 ```bash
 cd RomeForQwen
-modal run run_rome_grid.py
+modal run --detach run_rome_grid.py
 ```
 
-### Outputs (repo root)
+### Outputs (cloud Volume → pull locally)
 
 | File | Description |
 |------|-------------|
 | **`tuning_indices_used.json`** | The 150 dataset indices used for tuning. **Required for Phase 2.** |
-| **`rome_tuning_results.csv`** | One row per config: `layers`, `v_lr`, `v_num_grad_steps`, `Efficacy`, `Generalization`, `Locality`, `n_efficacy`, `n_generalization`, `n_locality`, **`composite_score`**. Use **composite_score** for an objective “best” config (e.g. row with max composite_score). |
+| **`rome_tuning_results.csv`** | One row per config: `layers`, `v_lr`, `v_num_grad_steps`, `Efficacy`, `Generalization`, `Locality`, `n_efficacy`, `n_generalization`, `n_locality`, **`composite_score`**. Use **composite_score** for an objective “best” config. |
+| **`rome_grid_metadata.json`** | Seed, dataset revision, grid definition, and the selection rule used to pick the best config. |
 
 ---
 
@@ -94,7 +99,7 @@ modal run run_rome_grid.py
 ### What it does
 
 1. Calls `rome_utils.set_seeds(16)`.
-2. Loads `qwen_known_indices.json` and **`tuning_indices_used.json`** (from Phase 1).
+2. Loads `qwen_known_indices.json` and **`tuning_indices_used.json`** from the cloud Volume (written by Phase 1).
 3. **Validation:** Asserts `set(tuning_indices).issubset(set(known_indices))` — integrity check that tuning indices are a subset of known indices.
 4. Computes **holdout set:** `holdout_indices = sorted(set(known_indices) - set(tuning_indices))`.
 5. Downloads `azhx/counterfact` (split `test`) at pinned `COUNTERFACT_REVISION`.
@@ -117,18 +122,36 @@ BEST_V_STEPS = 30
 
 ```bash
 cd RomeForQwen
-modal run run_rome_final_eval.py
+modal run --detach run_rome_final_eval.py
 ```
 
-**Requires:** `qwen_known_indices.json`, **`tuning_indices_used.json`** (from Phase 1), and the same CounterFact data file.
+**Requires:** `qwen_known_indices.json` (local), and **`tuning_indices_used.json`** in the cloud Volume (from Phase 1).
 
-### Outputs (repo root)
+### Outputs (cloud Volume → pull locally)
+
+Results are written to the same Modal Volume. Pull with `modal run pull_rome_results.py`.
 
 | File | Description |
 |------|-------------|
 | **`rome_final_baseline_metrics.csv`** | Per-edit rows (`edit_index`, `original_index`, `Efficacy`, `Generalization`, `Locality`), then a **MEAN** row, then an **N** row whose cells are **n_efficacy**, **n_generalization**, **n_locality** (sample sizes for each metric). |
+| **`rome_final_eval_metadata.json`** | Dataset revision, best hyperparameters used, split sizes (known/tuning/holdout), and a summary of mean metrics + N counts. |
 
 The local entrypoint also **prints** Efficacy, Generalization, and Locality with their N counts.
+
+---
+
+## Pull results from cloud
+
+**Script:** `pull_rome_results.py`
+
+If your laptop disconnected during a run, or you want to download results to a different machine:
+
+```bash
+cd RomeForQwen
+modal run pull_rome_results.py
+```
+
+This fetches all result files from the `rome-results` Volume and writes them to the current directory.
 
 ---
 

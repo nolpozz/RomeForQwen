@@ -18,6 +18,10 @@ import modal
 
 app = modal.App("rome-grid-search")
 
+# Cloud storage for results (persists across runs; safe if laptop disconnects)
+ROME_RESULTS_VOLUME = modal.Volume.from_name("rome-results", create_if_missing=True)
+RESULTS_DIR = "/results"
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 # Local EasyEdit source repo lives one level up in this workspace.
 EASYEDIT_SRC = PROJECT_ROOT.parent / "EasyEdit"
@@ -46,7 +50,6 @@ image = (
         "iopath",
         "opencv-python",
         "av",
-        "qwen_vl_utils",
         "zhipuai",
         "sentencepiece",
         "rouge",
@@ -71,6 +74,7 @@ image = (
     image=image,
     gpu="A100-40GB",
     timeout=86400,
+    volumes={RESULTS_DIR: ROME_RESULTS_VOLUME},
 )
 def run_rome_grid_search() -> tuple[list[dict], list[int]]:
     """
@@ -82,8 +86,21 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
     easyedit_dir = Path("/root/EasyEdit")
     sys.path.insert(0, str(easyedit_dir))
     sys.path.insert(0, str(project_dir))
+    # Apply Qwen2–ROME compatibility patch before loading model (see IMPLEMENTATION_NOTES.md)
+    import qwen2_rome_compat
+    qwen2_rome_compat.apply_qwen2_rome_compat_patch()
     from easyeditor import ROMEHyperParams, BaseEditor
+    from easyeditor.evaluate.evaluate import compute_rewrite_or_rephrase_quality
     import rome_utils
+
+    # Ensure Generalization fix is present (broadcast target for list rephrase prompts)
+    import inspect
+    _src = inspect.getsource(compute_rewrite_or_rephrase_quality)
+    if "norm_targets = [norm_targets] * len(norm_prompts)" not in _src:
+        raise RuntimeError(
+            "EasyEdit evaluate.py missing Generalization broadcast fix. "
+            "Update EasyEdit/easyeditor/evaluate/evaluate.py in workspace."
+        )
 
     rome_utils.set_seeds(16)
 
@@ -116,6 +133,17 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
     if len(records) != 150:
         raise ValueError(f"Expected 150 records after filter; got {len(records)}.")
     requests = [rome_utils.record_to_request(r) for r in records]
+
+    # Fail fast if we are not providing the inputs required for Generalization/Locality.
+    # (These should be present for CounterFact; if they aren't, metric columns will be empty.)
+    if not any("rephrase_prompt" in req for req in requests):
+        raise ValueError(
+            "No requests contain `rephrase_prompt`; cannot compute Generalization."
+        )
+    if not any(isinstance(req.get("locality"), dict) and "neighborhood" in req["locality"] for req in requests):
+        raise ValueError(
+            "No requests contain `locality.neighborhood`; cannot compute Locality."
+        )
 
     base_config = {
         "alg_name": "ROME",
@@ -150,6 +178,36 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
         for steps in [20, 30, 40]
     ]
 
+    # --- Write self-describing metadata for reproducibility / audit trail ---
+    # This is returned alongside the CSV so future steps can prove exactly what ran.
+    grid_metadata = {
+        "phase": "grid_search",
+        "seed": 16,
+        "dataset": {"name": "azhx/counterfact", "split": "test", "revision": COUNTERFACT_REVISION},
+        "model_name": base_config["model_name"],
+        "algorithm": base_config["alg_name"],
+        "n_tuning": len(tuning_indices_used),
+        "grid": [
+            {"layers": g["layers"][0], "v_lr": g["v_lr"], "v_num_grad_steps": g["v_num_grad_steps"]}
+            for g in grid
+        ],
+        "metrics_expected": ["Efficacy", "Generalization", "Locality", "composite_score"],
+        "selection_rule": {
+            "primary": "max composite_score (harmonic mean of Efficacy/Generalization/Locality)",
+            "tie_breaker": "max Efficacy, then max Generalization, then max Locality",
+        },
+    }
+
+    # Persist tuning indices + metadata immediately so detached runs can be monitored/pulled
+    # even while the grid search is still running.
+    out_dir = Path(RESULTS_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "tuning_indices_used.json", "w") as f:
+        json.dump(tuning_indices_used, f, indent=2)
+    with open(out_dir / "rome_grid_metadata.json", "w") as f:
+        json.dump(grid_metadata, f, indent=2)
+    ROME_RESULTS_VOLUME.commit()
+
     results = []
     for override in grid:
         config = {**base_config, **override}
@@ -165,7 +223,7 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
         composite = rome_utils.calculate_composite_score(
             agg["Efficacy"], agg["Generalization"], agg["Locality"]
         )
-        results.append({
+        row = {
             "layers": override["layers"][0],
             "v_lr": override["v_lr"],
             "v_num_grad_steps": override["v_num_grad_steps"],
@@ -176,12 +234,26 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
             "n_generalization": agg["n_generalization"],
             "n_locality": agg["n_locality"],
             "composite_score": composite,
-        })
+        }
+        if agg.get("Portability") is not None:
+            row["Portability"] = agg["Portability"]
+            row["n_portability"] = agg.get("n_portability", 0)
+        results.append(row)
+
+        # Checkpoint after each config so `pull_rome_results.py` can download
+        # partial progress while the run is still executing (useful for detach /
+        # disconnect).
+        import pandas as pd
+        pd.DataFrame(results).to_csv(out_dir / "rome_tuning_results.csv", index=False)
+        ROME_RESULTS_VOLUME.commit()
+
         del editor
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # Final commit for completeness.
+    ROME_RESULTS_VOLUME.commit()
     return results, tuning_indices_used
 
 
@@ -203,4 +275,20 @@ def main():
     df = pd.DataFrame(results)
     df.to_csv("rome_tuning_results.csv", index=False)
     print("Wrote rome_tuning_results.csv (includes composite_score for objective selection).")
+    with open("rome_grid_metadata.json", "w") as f:
+        json.dump(
+            {
+                "phase": "grid_search",
+                "seed": 16,
+                "dataset": {"name": "azhx/counterfact", "split": "test", "revision": COUNTERFACT_REVISION},
+                "model_name": "Qwen/Qwen2.5-7B",
+                "algorithm": "ROME",
+                "n_tuning": len(tuning_indices_used),
+                "n_configs": len(df),
+                "columns": list(df.columns),
+            },
+            f,
+            indent=2,
+        )
+    print("Wrote rome_grid_metadata.json")
     print(df.to_string())

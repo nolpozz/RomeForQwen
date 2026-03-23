@@ -1,0 +1,204 @@
+{
+  "phase": "grid_search",
+  "seed": 16,
+  "dataset": {
+    "name": "azhx/counterfact",
+    "split": "test",
+    "revision": "c01c413f856ee38f5c080c9fc5e87aff478e2ff9"
+  },
+  "model_name": "Qwen/Qwen2.5-7B",
+  "algorithm": "ROME",
+  "n_tuning": 150,
+  "grid": [
+    {
+      "layers": 15,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 15,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 15,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 15,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 15,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 15,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 15,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 15,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 15,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 20,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 24,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.5,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.1,
+      "v_num_grad_steps": 40
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 20
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 30
+    },
+    {
+      "layers": 27,
+      "v_lr": 0.05,
+      "v_num_grad_steps": 40
+    }
+  ],
+  "metrics_expected": [
+    "Efficacy",
+    "Generalization",
+    "Locality",
+    "composite_score"
+  ],
+  "selection_rule": {
+    "primary": "max composite_score (harmonic mean of Efficacy/Generalization/Locality)",
+    "tie_breaker": "max Efficacy, then max Generalization, then max Locality"
+  }
+}

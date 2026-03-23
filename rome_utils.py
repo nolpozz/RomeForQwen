@@ -116,17 +116,18 @@ def _get_all_acc_keys(dict_list: list[dict]) -> set:
 def extract_metrics(metrics_list: list[dict]) -> dict[str, Any]:
     """
     Parse EasyEdit per-edit output (list of dicts with 'post' key).
-    Returns mean Efficacy, Generalization, Locality and sample size N for each metric,
-    since some records lack paraphrase or locality prompts.
+    Returns mean Efficacy, Generalization, Locality, Portability and sample size N
+    for each metric. Portability is included when the dataset provides one_hop etc.
     """
     if not metrics_list:
         return {
-            "Efficacy": None, "Generalization": None, "Locality": None,
-            "n_efficacy": 0, "n_generalization": 0, "n_locality": 0,
+            "Efficacy": None, "Generalization": None, "Locality": None, "Portability": None,
+            "n_efficacy": 0, "n_generalization": 0, "n_locality": 0, "n_portability": 0,
         }
     efficacy_vals = []
     generalization_vals = []
     locality_vals = []
+    portability_vals = []
     for m in metrics_list:
         post = m.get("post", {})
         if "rewrite_acc" in post:
@@ -146,13 +147,26 @@ def extract_metrics(metrics_list: list[dict]) -> dict[str, Any]:
                         loc_flat.append(v)
             if loc_flat:
                 locality_vals.append(float(np.mean(loc_flat)))
+        if "portability" in post and post["portability"]:
+            por_flat = []
+            for pkey in _get_all_acc_keys([post]):
+                if pkey in post["portability"]:
+                    v = post["portability"][pkey]
+                    if isinstance(v, (list, tuple)):
+                        por_flat.extend(v)
+                    else:
+                        por_flat.append(v)
+            if por_flat:
+                portability_vals.append(float(np.mean(por_flat)))
     return {
         "Efficacy": float(np.mean(efficacy_vals)) if efficacy_vals else None,
         "Generalization": float(np.mean(generalization_vals)) if generalization_vals else None,
         "Locality": float(np.mean(locality_vals)) if locality_vals else None,
+        "Portability": float(np.mean(portability_vals)) if portability_vals else None,
         "n_efficacy": len(efficacy_vals),
         "n_generalization": len(generalization_vals),
         "n_locality": len(locality_vals),
+        "n_portability": len(portability_vals),
     }
 
 
@@ -181,20 +195,55 @@ def record_to_request(record: dict) -> dict:
     fields, but will fall back to common nested structures (e.g. the
     `requested_rewrite` dict used in some variants) when those are absent.
     """
-    # Primary, flat schema
+    # Primary, flat schema (EasyEdit expects these keys for evaluation):
+    # - prompt, target_new, ground_truth
+    # - rephrase_prompt
+    # - locality_prompt, locality_ground_truth
     prompt = record.get("prompt")
     target_new = record.get("target_new")
     ground_truth = record.get("ground_truth")
+    subject = record.get("subject")
+    rephrase = record.get("rephrase_prompt")
+    loc_prompt = record.get("locality_prompt")
+    loc_ground = record.get("locality_ground_truth")
 
     # Fallback: nested requested_rewrite-style schema
     rw = record.get("requested_rewrite") or record.get("edit", {}).get("requested_rewrite")
     if rw and isinstance(rw, dict):
+        if subject is None:
+            subject = rw.get("subject")
         if prompt is None:
             prompt = rw.get("prompt")
         if target_new is None:
             target_new = rw.get("target_new")
         if ground_truth is None:
             ground_truth = rw.get("ground_truth") or rw.get("target_true")
+
+    # HuggingFace `azhx/counterfact` schema stores prompts differently:
+    # - paraphrase_prompts: list[str] (generalization)
+    # - neighborhood_prompts: list[str] (locality)
+    # - requested_rewrite.target_true: {"str": "..."} (ground truth)
+    if rephrase is None and "paraphrase_prompts" in record:
+        pp = record.get("paraphrase_prompts")
+        if isinstance(pp, (list, tuple)) and pp:
+            # Use ALL paraphrases for a more stable Generalization estimate.
+            rephrase = list(pp)
+    if loc_prompt is None and "neighborhood_prompts" in record:
+        nprompts = record.get("neighborhood_prompts")
+        if isinstance(nprompts, (list, tuple)) and nprompts:
+            # Use ALL neighborhood prompts for a more stable Locality estimate.
+            loc_prompt = list(nprompts)
+
+    if isinstance(target_new, dict) and "str" in target_new:
+        target_new = target_new["str"]
+    if isinstance(ground_truth, dict) and "str" in ground_truth:
+        ground_truth = ground_truth["str"]
+    if loc_ground is None and rw and isinstance(rw, dict):
+        # For CounterFact, neighborhood prompts are usually same-relation questions,
+        # so the correct answer is the original (target_true).
+        tt = rw.get("target_true") or rw.get("ground_truth")
+        if isinstance(tt, dict) and "str" in tt:
+            loc_ground = tt["str"]
 
     if prompt is None or target_new is None:
         raise KeyError(
@@ -203,35 +252,60 @@ def record_to_request(record: dict) -> dict:
     prompt = _coerce_text(prompt)
     target_new = _coerce_text(target_new)
     if ground_truth is None:
-        # As a last resort, treat empty ground truth as end-of-text.
+        # Prefer CounterFact's original answer if present; otherwise fall back.
         ground_truth = "<|endoftext|>"
-    else:
-        ground_truth = _coerce_text(ground_truth)
-    subject = record.get("subject")
+    ground_truth = _coerce_text(ground_truth)
+
     if not subject:
-        if "," in str(prompt):
+        if rw and isinstance(rw, dict) and rw.get("subject"):
+            subject = rw.get("subject")
+        elif "," in str(prompt):
             subject = str(prompt).split(",")[0].strip()
         else:
             words = str(prompt).split()[:2]
             subject = " ".join(words) if words else "unknown"
-    else:
-        subject = _coerce_text(subject)
-    rephrase = record.get("rephrase_prompt")
-    loc_prompt = record.get("locality_prompt")
-    loc_ground = record.get("locality_ground_truth")
-    locality = {}
+    subject = _coerce_text(subject)
+
+    # Fill CounterFact templates like "{} is located in"
+    if "{}" in prompt:
+        prompt = prompt.replace("{}", subject)
+
+    locality: dict[str, Any] = {}
     if loc_prompt is not None and loc_ground is not None:
-        locality["neighborhood"] = {"prompt": loc_prompt, "ground_truth": loc_ground}
-    req = {
+        # Allow list-valued locality prompts/ground truths; EasyEdit supports lists.
+        if isinstance(loc_prompt, (list, tuple)):
+            loc_prompts = [_coerce_text(p).replace("{}", subject) if "{}" in _coerce_text(p) else _coerce_text(p) for p in loc_prompt]
+        else:
+            loc_prompts = _coerce_text(loc_prompt).replace("{}", subject) if "{}" in _coerce_text(loc_prompt) else _coerce_text(loc_prompt)
+        if isinstance(loc_prompts, list):
+            loc_ground_truths = [_coerce_text(loc_ground)] * len(loc_prompts)
+        else:
+            loc_ground_truths = _coerce_text(loc_ground)
+        locality["neighborhood"] = {
+            "prompt": loc_prompts,
+            "ground_truth": loc_ground_truths,
+        }
+
+    req: dict[str, Any] = {
         "prompt": prompt,
         "target_new": target_new,
         "ground_truth": ground_truth,
         "subject": subject,
         "portability": {},
+        # EasyEdit editor expects this key to exist (even if empty).
         "locality": locality,
     }
+
     if rephrase is not None:
-        req["rephrase_prompt"] = rephrase
+        if isinstance(rephrase, (list, tuple)):
+            req["rephrase_prompt"] = [
+                _coerce_text(p).replace("{}", subject) if "{}" in _coerce_text(p) else _coerce_text(p)
+                for p in rephrase
+            ]
+        else:
+            rp = _coerce_text(rephrase)
+            req["rephrase_prompt"] = rp.replace("{}", subject) if "{}" in rp else rp
+
     return req
 
 
