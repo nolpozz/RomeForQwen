@@ -31,9 +31,10 @@ Shared logic (seeds, dataset loading, metrics, composite score) lives in **`rome
 ## Reproducibility
 
 - **Seed:** All randomness uses seed **16** (set in `rome_utils.set_seeds(16)`).
-- **EasyEdit:** Both Modal scripts use `add_local_dir(EasyEdit)` to bundle the **local** EasyEdit source from the workspace. The workspace `EasyEdit/` must include the Generalization broadcast fix in `easyeditor/evaluate/evaluate.py`.
+- **EasyEdit:** Both Modal scripts use `add_local_dir(EasyEdit)` to bundle the **local** EasyEdit source from the workspace.
 - **Data:** CounterFact is loaded from Hugging Face dataset **`azhx/counterfact`** with a pinned dataset revision (`COUNTERFACT_REVISION`) in both scripts to prevent dataset drift.
-- **Generalization metric:** EasyEdit’s `evaluate.py` is patched to broadcast a single target to multiple rephrase prompts. Without this fix, `zip(prompts, "Antarctica")` yields character pairs and Generalization ≈ 0. Both Modal scripts verify the fix at startup and fail fast if it is missing.
+- **Evaluation mode:** Defaults to **`paper_rome`** (official ROME release scoring). Set `ROME_EVAL_METRIC=prob_compare` to force the legacy EasyEdit scoring. See `METRICS_PARITY.md`.
+- **Generalization broadcast fix:** Required only for `eval_metric=prob_compare` (legacy path). `paper_rome` uses official ROME batching and does not depend on that fix.
 
 ---
 
@@ -74,7 +75,7 @@ Example:
 3. Downloads `azhx/counterfact` (split `test`) at pinned `COUNTERFACT_REVISION`.
 4. Deduplicates and validates known IDs against the dataset; uses **seeded** `random.sample` to pick **150** tuning IDs; saves them locally as `tuning_indices_used.json`.
 5. Filters the downloaded dataset via `rome_utils.load_and_filter_dataset(tuning_indices_used, dataset_records=...)` and builds editor requests with `rome_utils.record_to_request` (uses **all** `paraphrase_prompts` and **all** `neighborhood_prompts` per record for more robust Generalization/Locality).
-5. Runs a grid over **layers** ∈ {15, 20, 24, 27}, **v_lr** ∈ {5e-1, 1e-1, 5e-2}, **v_num_grad_steps** ∈ {20, 30, 40} (36 configs). For each config, ROME uses `rewrite_module_tmp: "model.layers.{}.mlp.down_proj"` (Qwen SwiGLU).
+5. Runs a grid over **layers** ∈ {15, 20, 24, 27}, **v_lr** ∈ {5e-1, 1e-1, 5e-2}, **v_num_grad_steps** ∈ {20, 30, 40} (**36** configs). For each config, ROME uses `rewrite_module_tmp: "model.layers.{}.mlp.down_proj"` (Qwen SwiGLU).
 6. Aggregates metrics with `rome_utils.extract_metrics()` (Efficacy, Generalization, Locality, and **n_efficacy**, **n_generalization**, **n_locality**) and computes the **composite score** with `rome_utils.calculate_composite_score()` (harmonic mean of the three metrics).
 
 ### Run
@@ -192,7 +193,7 @@ This fetches all result files from the `rome-results` Volume and writes them to 
 │  Modal (A100, seed 16, pinned EasyEdit)│            │
 │  • known_indices → sample 150          │            │
 │  • load_and_filter_dataset(tuning)     │            │
-│  • 108 configs → extract_metrics +    │            │
+│  • 36 configs → extract_metrics +     │            │
 │    composite_score                     │            │
 └───────────────────────────────────────┘            │
         │                                             │

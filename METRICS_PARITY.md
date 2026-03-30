@@ -16,10 +16,10 @@ Predicates use **strict** inequality; ties count as failure.
 
 | `eval_metric` | Meaning |
 |---------------|---------|
-| `prob_compare` (default) | Previous behavior: sum of log-probs, `add_special_tokens=False`, `compute_sequence_log_probability` in `evaluate_utils.py`. Preserves historical CSVs. |
+| `prob_compare` | Legacy behavior: sum of log-probs, `add_special_tokens=False`, `compute_sequence_log_probability` in `evaluate_utils.py`. Preserves historical CSVs. |
 | `paper_rome` | Port of official `test_batch_prediction` + `summarize.py` discrete rules in `EasyEdit/easyeditor/evaluate/rome_paper_eval.py`, invoked from `compute_edit_quality` when `eval_metric == "paper_rome"`. |
 
-Modal / scripts: set environment variable **`ROME_EVAL_METRIC=paper_rome`** to use paper-aligned scoring (default unset → `prob_compare`).
+Modal / scripts: **default is `paper_rome`**. Set environment variable **`ROME_EVAL_METRIC=prob_compare`** to force legacy scoring for historical comparisons.
 
 ## Diff summary (official vs former `prob_compare`)
 

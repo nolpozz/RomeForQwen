@@ -49,7 +49,7 @@ A **reproducible two-phase evaluation pipeline** for [ROME](https://github.com/n
 ## Reproducibility
 
 - **Random seed:** 16 (in `rome_utils.set_seeds(16)`).
-- **EasyEdit:** Installed as PyPI package `easyeditor==0.0.1` in both Modal scripts.
+- **EasyEdit:** Both Modal scripts mount the local `EasyEdit/` directory into the container (so evaluation and compatibility patches are pinned to this workspace checkout).
 - **Data:** CounterFact is downloaded from `azhx/counterfact` at a pinned dataset revision (`COUNTERFACT_REVISION`) in both scripts to prevent drift.
 
 ---
@@ -66,6 +66,11 @@ A **reproducible two-phase evaluation pipeline** for [ROME](https://github.com/n
 **Composite score** = harmonic mean of (Efficacy, Generalization, Locality), used in Phase 1 to select the best hyperparameters objectively.
 
 **Note:** The `azhx/counterfact` dataset includes Efficacy, Generalization, and Locality. Portability requires one-hop prompts (e.g. `alternative_prompts`, `one_hop`); it is captured when present and written to the final eval outputs.
+
+### Evaluation mode switch
+
+- **Default**: `paper_rome` (official ROME release scoring).
+- **Override**: set `ROME_EVAL_METRIC=prob_compare` to force legacy EasyEdit scoring for historical comparisons.
 
 ## Result artifacts (written to Modal Volume)
 

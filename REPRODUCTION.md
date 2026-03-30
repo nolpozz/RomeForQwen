@@ -113,7 +113,7 @@ Our pipeline **captures Portability when it exists** in the request (e.g. if `re
 |-------|----------|------------|
 | **Different model** | Known | We use Qwen2.5-7B, not GPT-J/GPT-2 XL. Results are not directly comparable to the original paper. |
 | **Possible data contamination** | Unknown | Qwen2.5-7B may have seen CounterFact or similar data during training. This is a general concern for knowledge-editing benchmarks. |
-| **Grid size in docs** | Minor | `IMPLEMENTATION_NOTES.md` and `WORKFLOW.md` mention "108 configs"; the actual grid is 36 (4×3×3). |
+| **Grid size in docs** | Resolved | Docs now consistently state 36 configs (4×3×3). |
 
 ---
 
