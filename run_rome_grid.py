@@ -3,6 +3,9 @@ Phase 1: ROME hyperparameter grid search on Qwen2.5-7B (Modal).
 Run from this directory: modal run run_rome_grid.py
 
 Uses rome_utils for seeds, dataset loading, metrics, and composite score.
+
+Evaluation: default ``prob_compare``. Set ``ROME_EVAL_METRIC=paper_rome`` for official ROME
+release scoring (see RomeForQwen/METRICS_PARITY.md).
 """
 from __future__ import annotations
 
@@ -61,7 +64,9 @@ image = (
         "pyyaml",
         "tqdm",
         "fairscale",
+        "regex",
     )
+    .run_commands("python -c \"import nltk; nltk.download('punkt_tab')\"")
     .add_local_dir(str(EASYEDIT_SRC), "/root/EasyEdit")
     .add_local_dir(str(PROJECT_ROOT), "/root/project")
 )
@@ -81,7 +86,9 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
     Load known indices, sample 150 for tuning, run ROME grid, return results
     and tuning_indices_used. Uses rome_utils for reproducibility and metrics.
     """
+    import os
     import random
+
     project_dir = Path("/root/project")
     easyedit_dir = Path("/root/EasyEdit")
     sys.path.insert(0, str(easyedit_dir))
@@ -93,14 +100,23 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
     from easyeditor.evaluate.evaluate import compute_rewrite_or_rephrase_quality
     import rome_utils
 
-    # Ensure Generalization fix is present (broadcast target for list rephrase prompts)
-    import inspect
-    _src = inspect.getsource(compute_rewrite_or_rephrase_quality)
-    if "norm_targets = [norm_targets] * len(norm_prompts)" not in _src:
-        raise RuntimeError(
-            "EasyEdit evaluate.py missing Generalization broadcast fix. "
-            "Update EasyEdit/easyeditor/evaluate/evaluate.py in workspace."
+    # Default to paper-aligned scoring because Modal may not forward local env vars.
+    eval_metric = os.environ.get("ROME_EVAL_METRIC", "paper_rome")
+    print(f"[ROME grid search] Using eval_metric={eval_metric!r} (set via ROME_EVAL_METRIC).")
+    if eval_metric not in {"prob_compare", "paper_rome"}:
+        raise ValueError(
+            f"Unknown ROME_EVAL_METRIC={eval_metric!r}. Expected 'prob_compare' or 'paper_rome'."
         )
+    # prob_compare relies on broadcast fix for list paraphrases; paper_rome matches official ROME batching.
+    if eval_metric != "paper_rome":
+        import inspect
+
+        _src = inspect.getsource(compute_rewrite_or_rephrase_quality)
+        if "norm_targets = [norm_targets] * len(norm_prompts)" not in _src:
+            raise RuntimeError(
+                "EasyEdit evaluate.py missing Generalization broadcast fix. "
+                "Update EasyEdit/easyeditor/evaluate/evaluate.py in workspace."
+            )
 
     rome_utils.set_seeds(16)
 
@@ -191,10 +207,11 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
             {"layers": g["layers"][0], "v_lr": g["v_lr"], "v_num_grad_steps": g["v_num_grad_steps"]}
             for g in grid
         ],
-        "metrics_expected": ["Efficacy", "Generalization", "Locality", "composite_score"],
+        "metrics_expected": ["ES", "PS", "NS", "S"],
+        "eval_metric": eval_metric,
         "selection_rule": {
-            "primary": "max composite_score (harmonic mean of Efficacy/Generalization/Locality)",
-            "tie_breaker": "max Efficacy, then max Generalization, then max Locality",
+            "primary": "max S (harmonic mean of ES, PS, NS per ROME paper)",
+            "tie_breaker": "max ES, then max PS, then max NS",
         },
     }
 
@@ -218,22 +235,23 @@ def run_rome_grid_search() -> tuple[list[dict], list[int]]:
             sequential_edit=False,
             verbose=False,
             test_generation=False,
+            eval_metric=eval_metric,
         )
         agg = rome_utils.extract_metrics(all_metrics)
-        composite = rome_utils.calculate_composite_score(
-            agg["Efficacy"], agg["Generalization"], agg["Locality"]
+        s_score = rome_utils.calculate_composite_score(
+            agg["ES"], agg["PS"], agg["NS"]
         )
         row = {
             "layers": override["layers"][0],
             "v_lr": override["v_lr"],
             "v_num_grad_steps": override["v_num_grad_steps"],
-            "Efficacy": agg["Efficacy"],
-            "Generalization": agg["Generalization"],
-            "Locality": agg["Locality"],
-            "n_efficacy": agg["n_efficacy"],
-            "n_generalization": agg["n_generalization"],
-            "n_locality": agg["n_locality"],
-            "composite_score": composite,
+            "ES": agg["ES"],
+            "PS": agg["PS"],
+            "NS": agg["NS"],
+            "n_ES": agg["n_ES"],
+            "n_PS": agg["n_PS"],
+            "n_NS": agg["n_NS"],
+            "S": s_score,
         }
         if agg.get("Portability") is not None:
             row["Portability"] = agg["Portability"]
@@ -274,7 +292,7 @@ def main():
     import pandas as pd
     df = pd.DataFrame(results)
     df.to_csv("rome_tuning_results.csv", index=False)
-    print("Wrote rome_tuning_results.csv (includes composite_score for objective selection).")
+    print("Wrote rome_tuning_results.csv (use max S for hyperparameter selection).")
     with open("rome_grid_metadata.json", "w") as f:
         json.dump(
             {

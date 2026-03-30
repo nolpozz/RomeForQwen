@@ -36,6 +36,9 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+# Local HF cache for paper_rome parity tests (test_paper_rome_eval_parity.py)
+.hf_parity_cache/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/

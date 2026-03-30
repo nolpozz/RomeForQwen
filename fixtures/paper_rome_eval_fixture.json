@@ -1,0 +1,16 @@
+{
+  "_comment": "Frozen strings used by RomeForQwen/test_paper_rome_eval_parity.py (GPT-2 parity run).",
+  "target_new": "Germany",
+  "target_true": "France",
+  "prefixes": [
+    "The capital of France is",
+    "Paris is in the country of"
+  ],
+  "record_shape_test": {
+    "prompt": "The capital of France is",
+    "target_new": "Berlin",
+    "ground_truth": "Paris",
+    "rephrase_prompt": ["France's capital city is"],
+    "neighborhood_prompts": ["London is in"]
+  }
+}

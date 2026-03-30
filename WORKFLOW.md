@@ -11,6 +11,8 @@ This document describes the full **two-phase evaluation pipeline** for [ROME](ht
 | **1** | `run_rome_grid.py` | Hyperparameter grid search on 150 seeded tuning samples; writes `tuning_indices_used.json` and `rome_tuning_results.csv` to a **cloud Volume** (persists if laptop disconnects). |
 | **2** | `run_rome_final_eval.py` | Definitive baseline evaluation on the **holdout set**; reads tuning indices from the Volume, writes `rome_final_baseline_metrics.csv` to the Volume. |
 | **Pull** | `pull_rome_results.py` | Downloads all result files from the cloud Volume to your local directory. Run anytime after Phase 1 or 2 completes (or if you disconnected). |
+| **Test** | `test_one_edit.py` | Run one edit to verify ES, PS, NS, GE metrics. Use `--local` for GPU or `modal run test_one_edit.py` for Modal. |
+| **Check** | `check_generation_prompts.py` | Report how many edits have non-empty `generation_prompts` (for Fluency). No GPU required. |
 
 **Cloud storage:** Results are written to a Modal Volume (`rome-results`) so runs complete and persist even if your laptop disconnects. Pull results locally with `modal run pull_rome_results.py`.
 

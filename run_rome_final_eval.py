@@ -2,8 +2,11 @@
 Phase 2: Definitive ROME baseline evaluation on holdout set (Modal).
 Run from this directory: modal run run_rome_final_eval.py
 
-Set BEST_LAYER, BEST_V_LR, BEST_V_STEPS from rome_tuning_results.csv (e.g. by composite_score).
+Set BEST_LAYER, BEST_V_LR, BEST_V_STEPS from rome_tuning_results.csv (select by max S).
 Uses same pinned image and rome_utils; validates tuning ⊆ known.
+
+Evaluation mode: default ``prob_compare`` (legacy EasyEdit). Set env ``ROME_EVAL_METRIC=paper_rome``
+for official kmeng01/rome CounterFact scoring (see RomeForQwen/METRICS_PARITY.md).
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import modal
 
 # -----------------------------------------------------------------------------
@@ -26,6 +30,9 @@ RESULTS_DIR = "/results"
 PROJECT_ROOT = Path(__file__).resolve().parent
 EASYEDIT_SRC = PROJECT_ROOT.parent / "EasyEdit"
 COUNTERFACT_REVISION = "c01c413f856ee38f5c080c9fc5e87aff478e2ff9"
+
+# Cap neighborhood locality prompts sent to EasyEdit (first N; CounterFact lists are length 10).
+MAX_NB_PROMPTS = 10
 
 image = (
     modal.Image.debian_slim(python_version="3.10")
@@ -60,7 +67,9 @@ image = (
         "pyyaml",
         "tqdm",
         "fairscale",
+        "regex",
     )
+    .run_commands("python -c \"import nltk; nltk.download('punkt_tab')\"")
     .add_local_dir(str(EASYEDIT_SRC), "/root/EasyEdit")
     .add_local_dir(str(PROJECT_ROOT), "/root/project")
 )
@@ -77,33 +86,44 @@ image = (
 )
 def run_rome_final_eval() -> tuple[list[dict], dict]:
     """
-    Build holdout = known_indices \\ tuning_indices, run ROME with best params,
-    return per-edit metrics and aggregate (with n_efficacy, n_generalization, n_locality).
+    Build holdout = known_indices \\ tuning_indices, run ROME with best params.
+    Returns per-edit metrics and aggregate using paper names: ES, PS, NS, GE, S.
     """
     project_dir = Path("/root/project")
     easyedit_dir = Path("/root/EasyEdit")
     sys.path.insert(0, str(easyedit_dir))
     sys.path.insert(0, str(project_dir))
     # Apply Qwen2–ROME compatibility patch before loading model (see IMPLEMENTATION_NOTES.md)
+    import os
+
     import qwen2_rome_compat
     qwen2_rome_compat.apply_qwen2_rome_compat_patch()
     from easyeditor import ROMEHyperParams, BaseEditor
     from easyeditor.evaluate.evaluate import compute_rewrite_or_rephrase_quality
     import rome_utils
 
-    # Ensure Generalization fix is present (broadcast target for list rephrase prompts)
-    import inspect
-    _src = inspect.getsource(compute_rewrite_or_rephrase_quality)
-    if "norm_targets = [norm_targets] * len(norm_prompts)" not in _src:
-        raise RuntimeError(
-            "EasyEdit evaluate.py missing Generalization broadcast fix. "
-            "Update EasyEdit/easyeditor/evaluate/evaluate.py in workspace."
+    # Default to paper-aligned scoring because Modal may not forward local env vars.
+    # prob_compare relies on broadcast fix for list paraphrases; paper_rome batches separately (official ROME).
+    eval_metric = os.environ.get("ROME_EVAL_METRIC", "paper_rome")
+    print(f"[ROME final eval] Using eval_metric={eval_metric!r} (set via ROME_EVAL_METRIC).")
+    if eval_metric not in {"prob_compare", "paper_rome"}:
+        raise ValueError(
+            f"Unknown ROME_EVAL_METRIC={eval_metric!r}. Expected 'prob_compare' or 'paper_rome'."
         )
+    if eval_metric != "paper_rome":
+        import inspect
+
+        _src = inspect.getsource(compute_rewrite_or_rephrase_quality)
+        if "norm_targets = [norm_targets] * len(norm_prompts)" not in _src:
+            raise RuntimeError(
+                "EasyEdit evaluate.py missing Generalization broadcast fix. "
+                "Update EasyEdit/easyeditor/evaluate/evaluate.py in workspace."
+            )
 
     rome_utils.set_seeds(16)
 
-    # ---------- Best hyperparameters: set from grid search (max composite_score) ----------
-    # From rome_tuning_results.csv: layers=15, v_lr=0.1, steps=40 -> composite_score=0.8118
+    # ---------- Best hyperparameters: set from grid search (max S) ----------
+    # From rome_tuning_results.csv: layers=15, v_lr=0.1, steps=40 -> S highest
     BEST_LAYER = 15
     BEST_V_LR = 1e-1
     BEST_V_STEPS = 40
@@ -143,7 +163,20 @@ def run_rome_final_eval() -> tuple[list[dict], dict]:
         dataset_records=dataset_records,
         id_field="case_id",
     )
-    requests = [rome_utils.record_to_request(r) for r in records]
+    nb_stats = rome_utils.neighborhood_prompt_count_stats(
+        records,
+        max_nb_prompts=MAX_NB_PROMPTS,
+    )
+    print(
+        "Neighborhood prompts (holdout): "
+        f"raw min/mean/max = {nb_stats['raw_min']} / {nb_stats['raw_mean']:.4f} / {nb_stats['raw_max']}; "
+        f"after cap max_nb_prompts={MAX_NB_PROMPTS}: "
+        f"min/mean/max = {nb_stats['after_cap_min']} / {nb_stats['after_cap_mean']:.4f} / {nb_stats['after_cap_max']} "
+        f"(N records with neighborhood = {nb_stats['n_records_with_neighborhood']})"
+    )
+    requests = [
+        rome_utils.record_to_request(r, max_nb_prompts=MAX_NB_PROMPTS) for r in records
+    ]
     if not requests:
         raise ValueError(
             f"No holdout records loaded (requested {len(holdout_indices)}). "
@@ -196,27 +229,26 @@ def run_rome_final_eval() -> tuple[list[dict], dict]:
         requests,
         sequential_edit=False,
         verbose=False,
-        test_generation=False,
+        test_generation=True,  # Enable Fluency (GE) via n-gram entropy
+        eval_metric=eval_metric,
     )
 
     agg = rome_utils.extract_metrics(all_metrics)
     per_edit = []
-    # Use (records, all_metrics) so original_index matches each metric when load_and_filter_dataset
-    # drops some holdout indices (e.g. case_id not in dataset).
     for idx, (record, m) in enumerate(zip(records, all_metrics)):
         orig_idx = record.get("case_id", idx)
         post = m.get("post", {})
         row = {"edit_index": idx, "original_index": orig_idx}
         if "rewrite_acc" in post:
             v = post["rewrite_acc"]
-            row["Efficacy"] = float(v) if not isinstance(v, (list, tuple)) else sum(v) / len(v)
+            row["ES"] = float(np.mean(v)) if isinstance(v, (list, tuple)) else float(v)
         else:
-            row["Efficacy"] = None
+            row["ES"] = None
         if "rephrase_acc" in post:
             v = post["rephrase_acc"]
-            row["Generalization"] = float(v) if not isinstance(v, (list, tuple)) else sum(v) / len(v)
+            row["PS"] = float(np.mean(v)) if isinstance(v, (list, tuple)) else float(v)
         else:
-            row["Generalization"] = None
+            row["PS"] = None
         if "locality" in post and post["locality"]:
             loc_vals = []
             for k, v in post["locality"].items():
@@ -225,9 +257,13 @@ def run_rome_final_eval() -> tuple[list[dict], dict]:
                         loc_vals.extend(v)
                     else:
                         loc_vals.append(v)
-            row["Locality"] = sum(loc_vals) / len(loc_vals) if loc_vals else None
+            row["NS"] = sum(loc_vals) / len(loc_vals) if loc_vals else None
         else:
-            row["Locality"] = None
+            row["NS"] = None
+        if "fluency" in post and isinstance(post["fluency"], dict) and "ngram_entropy" in post["fluency"]:
+            row["GE"] = float(post["fluency"]["ngram_entropy"])
+        else:
+            row["GE"] = None
         if "portability" in post and post["portability"]:
             por_vals = []
             for k, v in post["portability"].items():
@@ -241,41 +277,39 @@ def run_rome_final_eval() -> tuple[list[dict], dict]:
             row["Portability"] = None
         per_edit.append(row)
 
-    # Composite score (harmonic mean of E/G/L, matching grid selection)
-    composite = rome_utils.calculate_composite_score(
-        agg["Efficacy"], agg["Generalization"], agg["Locality"]
-    )
+    s_score = agg["S"]
     summary = {
-        "Efficacy": agg["Efficacy"],
-        "Generalization": agg["Generalization"],
-        "Locality": agg["Locality"],
+        "ES": agg["ES"],
+        "PS": agg["PS"],
+        "NS": agg["NS"],
+        "GE": agg["GE"],
+        "S": s_score,
         "Portability": agg.get("Portability"),
-        "composite_score": composite,
-        "n_efficacy": agg["n_efficacy"],
-        "n_generalization": agg["n_generalization"],
-        "n_locality": agg["n_locality"],
+        "n_ES": agg["n_ES"],
+        "n_PS": agg["n_PS"],
+        "n_NS": agg["n_NS"],
+        "n_GE": agg["n_GE"],
         "n_portability": agg.get("n_portability", 0),
         "n_holdout": len(holdout_indices),
     }
 
-    # Persist to cloud Volume (survives disconnect; pull with pull_rome_results.py)
     import pandas as pd
     out_dir = Path(RESULTS_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(per_edit)
-    cols = ["edit_index", "original_index", "Efficacy", "Generalization", "Locality", "Portability"]
+    cols = ["edit_index", "original_index", "ES", "PS", "NS", "GE", "Portability"]
     df = df[[c for c in cols if c in df.columns]]
     mean_data = {
         "edit_index": "MEAN", "original_index": "",
-        "Efficacy": summary["Efficacy"], "Generalization": summary["Generalization"],
-        "Locality": summary["Locality"], "Portability": summary.get("Portability"),
-        "composite_score": summary.get("composite_score"),
+        "ES": summary["ES"], "PS": summary["PS"], "NS": summary["NS"],
+        "GE": summary["GE"], "Portability": summary.get("Portability"),
+        "S": summary["S"],
     }
-    mean_row = pd.DataFrame([{k: v for k, v in mean_data.items() if k in df.columns or k == "composite_score"}])
+    mean_row = pd.DataFrame([{k: v for k, v in mean_data.items() if k in df.columns or k == "S"}])
     n_data = {
         "edit_index": "N", "original_index": "",
-        "Efficacy": summary["n_efficacy"], "Generalization": summary["n_generalization"],
-        "Locality": summary["n_locality"], "Portability": summary.get("n_portability", 0),
+        "ES": summary["n_ES"], "PS": summary["n_PS"], "NS": summary["n_NS"],
+        "GE": summary["n_GE"], "Portability": summary.get("n_portability", 0),
     }
     n_row = pd.DataFrame([{k: v for k, v in n_data.items() if k in df.columns}])
     df = pd.concat([df, mean_row, n_row], ignore_index=True)
@@ -298,6 +332,9 @@ def run_rome_final_eval() -> tuple[list[dict], dict]:
                 "n_known": len(known_indices),
                 "n_tuning": len(tuning_indices),
                 "n_holdout": len(holdout_indices),
+                "max_nb_prompts": MAX_NB_PROMPTS,
+                "eval_metric": eval_metric,
+                "neighborhood_prompt_count_stats": nb_stats,
                 "summary": summary,
             },
             f,
@@ -320,12 +357,14 @@ def main():
     per_edit, summary = run_rome_final_eval.remote()
 
     print(f"Holdout size: {summary['n_holdout']}")
-    print(f"Efficacy:       {summary['Efficacy']}  (N = {summary['n_efficacy']})")
-    print(f"Generalization: {summary['Generalization']}  (N = {summary['n_generalization']})")
-    print(f"Locality:       {summary['Locality']}  (N = {summary['n_locality']})")
+    print(f"ES (Efficacy):        {summary['ES']}  (N = {summary['n_ES']})")
+    print(f"PS (Paraphrase):      {summary['PS']}  (N = {summary['n_PS']})")
+    print(f"NS (Neighborhood):    {summary['NS']}  (N = {summary['n_NS']})")
+    if summary.get("GE") is not None:
+        print(f"GE (Fluency):         {summary['GE']}  (N = {summary['n_GE']})")
     if summary.get("Portability") is not None:
-        print(f"Portability:    {summary['Portability']}  (N = {summary.get('n_portability', 0)})")
-    if summary.get("composite_score") is not None:
-        print(f"Composite:      {summary['composite_score']}")
+        print(f"Portability:          {summary['Portability']}  (N = {summary.get('n_portability', 0)})")
+    if summary.get("S") is not None:
+        print(f"S (Composite):        {summary['S']}")
 
     print("Results saved to cloud Volume (pull anytime with: modal run pull_rome_results.py)")

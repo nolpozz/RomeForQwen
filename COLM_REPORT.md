@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-We reproduce **ROME** (Rank-One Model Editing; Meng et al., NeurIPS 2022) on **Qwen/Qwen2.5-7B** using the CounterFact benchmark. ROME applies a rank-one update to MLP layers to edit factual associations. On a held-out evaluation set of 468 samples, ROME achieves **100% Efficacy**, **72.8% Generalization**, and **76.6% Locality**, with a composite score of **0.815**.
+We reproduce **ROME** (Rank-One Model Editing; Meng et al., NeurIPS 2022) on **Qwen/Qwen2.5-7B** using the CounterFact benchmark. ROME applies a rank-one update to MLP layers to edit factual associations. On a held-out evaluation set of 468 samples, ROME achieves **100% Efficacy (ES)**, **94.34% Generalization (PS)**, and **64.38% Specificity (NS)**, with a composite score **S = 0.8303** (latest pulled Phase 2 run; `rome_final_eval_metadata.json`).
 
 ---
 
@@ -34,20 +34,21 @@ ROME (Rank-One Model Editing) treats an MLP module as a key-value store: the key
 | **Holdout set** | 468 samples (known − tuning) |
 | **Seed** | 16 |
 
-### 2.2 Evaluation Metrics
+### 2.2 Evaluation Metrics (Aligned with ROME Paper)
 
-| Metric | Definition |
-|--------|------------|
-| **Efficacy** | Success rate on the direct rewrite prompt (target_new) |
-| **Generalization** | Paraphrase accuracy across all `paraphrase_prompts` |
-| **Locality** | Neighborhood specificity across all `neighborhood_prompts` (no unintended changes) |
-| **Composite** | Harmonic mean of Efficacy, Generalization, Locality |
+| Metric | Paper Variable | Definition | Implementation |
+|--------|----------------|------------|----------------|
+| **ES** (Efficacy Score) | Efficacy | P(o*) > P(oc) post-edit on rewrite prompt | Probability comparison (mean token NLL) |
+| **PS** (Paraphrase Score) | Generalization | P(o*) > P(oc) on paraphrase prompts | Probability comparison |
+| **NS** (Neighborhood Score) | Specificity | P(oc) > P(o*) on neighborhood prompts | Probability comparison |
+| **GE** (Fluency) | Fluency | N-gram entropy of generations | Weighted bi-/tri-gram entropy |
+| **S** (Composite) | Composite | Harmonic mean of ES, PS, NS | Same |
 
-Evaluation uses teacher-forcing token-level accuracy (EasyEdit default). Portability is not evaluated; the dataset lacks one-hop prompts.
+Metrics use `eval_metric="paper_rome"`: ES/PS count success when the model assigns higher probability to the counterfactual object o* than the original oc; NS counts success when P(oc) > P(o*) on neighborhood prompts (model favors the original object over the edit target). Per edit, NS is the mean over neighborhood prompts; Phase 2 uses `max_nb_prompts=10` (first 10 entries; CounterFact provides 10). Portability is not evaluated; the dataset lacks one-hop prompts.
 
 ### 2.3 Hyperparameter Selection
 
-A grid search over 36 configurations (layers ∈ {15, 20, 24, 27}, v_lr ∈ {0.5, 0.1, 0.05}, steps ∈ {20, 30, 40}) was run on the tuning set. The configuration with the **highest composite score** was selected for holdout evaluation.
+A grid search over 36 configurations (layers ∈ {15, 20, 24, 27}, v_lr ∈ {0.5, 0.1, 0.05}, steps ∈ {20, 30, 40}) was run on the tuning set. The configuration with the **highest composite score S** was selected for holdout evaluation.
 
 ---
 
@@ -55,12 +56,12 @@ A grid search over 36 configurations (layers ∈ {15, 20, 24, 27}, v_lr ∈ {0.5
 
 ### 3.1 Grid Search (Tuning Set, N=150)
 
-The best configuration was **layer 15, v_lr=0.1, steps=40** with composite score **0.812** on the tuning set.
+The best configuration was **layer 15, v_lr=0.1, steps=40** with composite score **S = 0.812** on the tuning set.
 
 Top 5 configurations by composite score:
 
-| Layers | v_lr | Steps | Efficacy | Generalization | Locality | Composite |
-|--------|------|-------|----------|----------------|----------|-----------|
+| Layers | v_lr | Steps | ES (Efficacy) | PS (Generalization) | NS (Specificity) | S (Composite) |
+|--------|------|-------|---------------|---------------------|------------------|---------------|
 | 15 | 0.1 | 40 | 0.993 | 0.720 | 0.769 | **0.812** |
 | 15 | 0.1 | 30 | 0.993 | 0.717 | 0.770 | 0.811 |
 | 15 | 0.1 | 20 | 0.993 | 0.703 | 0.783 | 0.809 |
@@ -71,14 +72,19 @@ Top 5 configurations by composite score:
 
 ### 3.2 Holdout Evaluation (N=468)
 
-| Metric | Score | N |
-|--------|-------|---|
-| **Efficacy** | **100.0%** | 468 |
-| **Generalization** | **72.8%** | 468 |
-| **Locality** | **76.6%** | 468 |
-| **Composite** | **0.815** | — |
+Numbers below match the **pulled** Phase 2 artifact `rome_final_eval_metadata.json` (and aggregate row `MEAN` in `rome_final_baseline_metrics.csv`).
 
-Efficacy is perfect on the holdout set. Generalization (paraphrase robustness) and Locality (neighborhood preservation) are strong and well-balanced, indicating that ROME reliably updates the target fact without unduly affecting unrelated knowledge.
+| Metric | Paper Variable | Score | N |
+|--------|----------------|-------|---|
+| **ES** | Efficacy | **100.0%** | 468 |
+| **PS** | Generalization | **94.34%** | 468 |
+| **NS** | Specificity | **64.38%** | 468 |
+| **GE** | Fluency | 6.214 | 468 |
+| **S** | Composite | **0.8303** | — |
+
+**NS (Specificity).** Mean NS is **0.6438** averaged over 468 edits. Each edit’s NS is itself the mean of up to **10** binary neighborhood outcomes (one per `neighborhood_prompts` entry; `max_nb_prompts=10` in the pipeline). Per-edit values span the full 0–1 range in the CSV (e.g. many edits sit around 0.5–0.9, some near 0), so the headline NS is **well below** efficacy and reflects inconsistent preservation on related subjects rather than a single failure mode.
+
+Efficacy is perfect on the holdout set. Generalization (paraphrase robustness) remains strong at **94.34%**. Specificity (**64.38%**) is lower than in the original paper, consistent with spillover of the edit to semantically related queries under this probability-based NS definition.
 
 ---
 
@@ -88,8 +94,8 @@ Efficacy is perfect on the holdout set. Generalization (paraphrase robustness) a
 
 ROME was designed for GPT-style models. Running it on Qwen2 required two compatibility fixes:
 
-1. **Nethook fix (EasyEdit):** PyTorch’s forward hook with `with_kwargs=True` passes four arguments `(module, args, kwargs, result)`. The original nethook mistakenly used `kwargs` as the output; the fix correctly uses `result`.
-2. **Qwen2 attention patch:** Qwen2’s attention can return dict-like objects. A patch in `qwen2_rome_compat.py` unwraps these before the residual add to avoid `TypeError: unsupported operand type(s) for +: 'Tensor' and 'dict'`.
+1. **Nethook fix (EasyEdit):** PyTorch's forward hook with `with_kwargs=True` passes four arguments `(module, args, kwargs, result)`. The original nethook mistakenly used `kwargs` as the output; the fix correctly uses `result`.
+2. **Qwen2 attention patch:** Qwen2's attention can return dict-like objects. A patch in `qwen2_rome_compat.py` unwraps these before the residual add to avoid `TypeError: unsupported operand type(s) for +: 'Tensor' and 'dict'`.
 
 These changes are **compatibility fixes only**; the ROME algorithm (rank-one update, compute_u, compute_v) is unchanged.
 
@@ -103,7 +109,7 @@ These changes are **compatibility fixes only**; the ROME algorithm (rank-one upd
 
 To avoid overfitting the evaluation set:
 
-- **Phase 1:** Grid search on 150 tuning samples → select best hyperparameters by composite score.
+- **Phase 1:** Grid search on 150 tuning samples → select best hyperparameters by composite score S.
 - **Phase 2:** Final evaluation on 468 holdout samples with the selected config.
 
 Tuning indices are persisted in a Modal Volume so the split is reproducible.
@@ -125,35 +131,35 @@ Tuning indices are persisted in a Modal Volume so the split is reproducible.
 
 ### 6.1 Original Paper Results (CounterFact, Table 4)
 
-| Model | Efficacy | Generalization (PS) | Specificity / Locality (NS) | Composite (S) |
-|-------|----------|---------------------|-----------------------------|---------------|
+| Model | ES (Efficacy) | PS (Generalization) | NS (Specificity) | S (Composite) |
+|-------|---------------|---------------------|------------------|---------------|
 | **GPT-2 XL** | 100.0% | **96.4%** | 75.4% | 89.2 |
 | **GPT-J** | 99.9% | **99.1%** | 78.9% | 91.5 |
 
 ### 6.2 Our Reproduction (Qwen2.5-7B)
 
-| Metric | Result |
-|--------|--------|
-| **Efficacy** | **100.0%** |
-| **Generalization** | **72.8%** |
-| **Locality** | **76.6%** |
-| **Composite** | 0.815 |
+| Metric | Paper Variable | Result |
+|--------|----------------|--------|
+| **ES** | Efficacy | **100.0%** |
+| **PS** | Generalization | **94.34%** |
+| **NS** | Specificity | **64.38%** |
+| **S** | Composite | 0.8303 |
 
 ### 6.3 Interpretation
 
 | Question | Answer |
 |----------|--------|
-| Is ROME equally effective on Qwen? | **Yes** — 100% efficacy, on par with the paper. |
-| Does it preserve locality equally well? | **Yes** — 76.6% vs. 75–79% in the paper. |
-| Does it generalize equally well? | **No** — 72.8% vs. 96–99% in the paper; ~20–25 point gap. |
-| Are its limitations the same? | **Partly** — locality is similar; generalization is the main difference. |
+| Is ROME equally effective on Qwen? | **Yes** — 100% ES, on par with the paper. |
+| Does it preserve specificity equally well? | **No** — 64.38% NS vs. 75–79% in the paper; ~11–15 point gap. |
+| Does it generalize equally well? | **Nearly** — 94.34% PS vs. 96–99% in the paper; small gap. |
+| Are its limitations the same? | **Partly** — efficacy and generalization are strong; specificity is the main difference. |
 
-**Summary:** ROME on Qwen2.5-7B matches the paper on direct rewrites (Efficacy) and neighborhood preservation (Locality), but Generalization to paraphrases is noticeably weaker than reported for GPT-2 XL and GPT-J. ROME remains strong and well-localized on Qwen; the main drop is in paraphrase robustness.
+**Summary:** ROME on Qwen2.5-7B matches the paper on direct rewrites (ES) and approaches it on paraphrase generalization (PS). Specificity (NS ≈ 64.38%) is noticeably lower, indicating that the rank-one update on Qwen2.5-7B may affect a broader set of queries than on GPT-2 XL / GPT-J.
 
-### 6.4 Possible Causes for the Generalization Gap
+### 6.4 Possible Causes for the Specificity Gap
 
-- **Model architecture:** Qwen2.5-7B differs from GPT-2/GPT-J; layer 15 may not be as optimal for generalization as the layers used in the paper.
-- **Evaluation methodology:** The paper uses probability-based metrics (e.g. P[o*] > P[oc]); EasyEdit uses token-level accuracy. The metrics are not identical.
+- **Model architecture:** Qwen2.5-7B differs from GPT-2/GPT-J; the key space at layer 15 may have more overlap between edited and neighborhood subjects.
+- **Evaluation methodology:** We use probability-based metrics (P(o*) > P(oc), P(oc) > P(o*)) aligned with the paper; remaining differences may stem from tokenization or sequence-probability formulation.
 - **Data split:** The paper used fixed test sets (7,500 for GPT-2 XL, 2,000 for GPT-J); we use 468 holdout samples from a different filtered set.
 - **Dataset version:** We use `azhx/counterfact` on Hugging Face; schema differences from the original CounterFact may affect scores.
 
@@ -163,9 +169,9 @@ Tuning indices are persisted in a Modal Volume so the split is reproducible.
 
 *[Insert second method (e.g., fine-tuning, MEND, IKE, etc.) results here for COLM paper comparison.]*
 
-| Method | Efficacy | Generalization | Locality | Composite |
-|--------|----------|----------------|----------|-----------|
-| **ROME** | 100.0% | 72.8% | 76.6% | 0.815 |
+| Method | ES (Efficacy) | PS (Generalization) | NS (Specificity) | S (Composite) |
+|--------|---------------|---------------------|------------------|---------------|
+| **ROME** | 100.0% | 94.34% | 64.38% | 0.8303 |
 | *Method 2* | — | — | — | — |
 
 ---

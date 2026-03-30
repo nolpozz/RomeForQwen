@@ -4,10 +4,13 @@ Ensures reproducibility, consistent dataset handling, and objective metric aggre
 """
 from __future__ import annotations
 
+import logging
 import random
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_text(x: Any) -> str:
@@ -116,26 +119,34 @@ def _get_all_acc_keys(dict_list: list[dict]) -> set:
 def extract_metrics(metrics_list: list[dict]) -> dict[str, Any]:
     """
     Parse EasyEdit per-edit output (list of dicts with 'post' key).
-    Returns mean Efficacy, Generalization, Locality, Portability and sample size N
-    for each metric. Portability is included when the dataset provides one_hop etc.
+    Expects the same ``rewrite_acc`` / ``rephrase_acc`` / ``locality.*_acc`` keys for
+    both ``eval_metric="prob_compare"`` (EasyEdit) and ``eval_metric="paper_rome"``
+    (official ROME release scoring); only the per-prompt binary definitions differ.
+
+    Returns means and sample sizes for ROME paper metrics:
+    - ES (Efficacy Score): rewrite success
+    - PS (Paraphrase Score): generalization to paraphrases
+    - NS (Neighborhood Score): locality / specificity
+    - GE (Fluency): n-gram entropy of generations (higher = more fluent)
+    - S: harmonic mean of ES, PS, NS
     """
     if not metrics_list:
         return {
-            "Efficacy": None, "Generalization": None, "Locality": None, "Portability": None,
-            "n_efficacy": 0, "n_generalization": 0, "n_locality": 0, "n_portability": 0,
+            "ES": None, "PS": None, "NS": None, "GE": None, "S": None,
+            "n_ES": 0, "n_PS": 0, "n_NS": 0, "n_GE": 0,
         }
-    efficacy_vals = []
-    generalization_vals = []
-    locality_vals = []
-    portability_vals = []
+    es_vals = []
+    ps_vals = []
+    ns_vals = []
+    ge_vals = []
     for m in metrics_list:
         post = m.get("post", {})
         if "rewrite_acc" in post:
             v = post["rewrite_acc"]
-            efficacy_vals.append(float(np.mean(v)) if isinstance(v, (list, tuple)) else float(v))
+            es_vals.append(float(np.mean(v)) if isinstance(v, (list, tuple)) else float(v))
         if "rephrase_acc" in post:
             v = post["rephrase_acc"]
-            generalization_vals.append(float(np.mean(v)) if isinstance(v, (list, tuple)) else float(v))
+            ps_vals.append(float(np.mean(v)) if isinstance(v, (list, tuple)) else float(v))
         if "locality" in post and post["locality"]:
             loc_flat = []
             for lkey in _get_all_acc_keys([post]):
@@ -146,7 +157,13 @@ def extract_metrics(metrics_list: list[dict]) -> dict[str, Any]:
                     else:
                         loc_flat.append(v)
             if loc_flat:
-                locality_vals.append(float(np.mean(loc_flat)))
+                ns_vals.append(float(np.mean(loc_flat)))
+        if "fluency" in post and isinstance(post["fluency"], dict) and "ngram_entropy" in post["fluency"]:
+            ge_vals.append(float(post["fluency"]["ngram_entropy"]))
+    # Portability: optional, when dataset provides one-hop etc.
+    portability_vals = []
+    for m in metrics_list:
+        post = m.get("post", {})
         if "portability" in post and post["portability"]:
             por_flat = []
             for pkey in _get_all_acc_keys([post]):
@@ -158,14 +175,22 @@ def extract_metrics(metrics_list: list[dict]) -> dict[str, Any]:
                         por_flat.append(v)
             if por_flat:
                 portability_vals.append(float(np.mean(por_flat)))
+    s_val = calculate_composite_score(
+        float(np.mean(es_vals)) if es_vals else None,
+        float(np.mean(ps_vals)) if ps_vals else None,
+        float(np.mean(ns_vals)) if ns_vals else None,
+    )
     return {
-        "Efficacy": float(np.mean(efficacy_vals)) if efficacy_vals else None,
-        "Generalization": float(np.mean(generalization_vals)) if generalization_vals else None,
-        "Locality": float(np.mean(locality_vals)) if locality_vals else None,
+        "ES": float(np.mean(es_vals)) if es_vals else None,
+        "PS": float(np.mean(ps_vals)) if ps_vals else None,
+        "NS": float(np.mean(ns_vals)) if ns_vals else None,
+        "GE": float(np.mean(ge_vals)) if ge_vals else None,
+        "S": s_val,
         "Portability": float(np.mean(portability_vals)) if portability_vals else None,
-        "n_efficacy": len(efficacy_vals),
-        "n_generalization": len(generalization_vals),
-        "n_locality": len(locality_vals),
+        "n_ES": len(es_vals),
+        "n_PS": len(ps_vals),
+        "n_NS": len(ns_vals),
+        "n_GE": len(ge_vals),
         "n_portability": len(portability_vals),
     }
 
@@ -176,8 +201,8 @@ def calculate_composite_score(
     locality: float | None,
 ) -> float | None:
     """
-    Harmonic mean of Efficacy, Generalization, and Locality.
-    Provides a single, mathematically objective score for hyperparameter selection.
+    Harmonic mean of ES, PS, NS (Score S per ROME paper).
+    Used for hyperparameter selection and aggregate reporting.
     Returns None if any metric is missing or non-positive.
     """
     if efficacy is None or generalization is None or locality is None:
@@ -187,13 +212,114 @@ def calculate_composite_score(
     return 3.0 / (1.0 / efficacy + 1.0 / generalization + 1.0 / locality)
 
 
-def record_to_request(record: dict) -> dict:
+def resolve_neighborhood_ground_truths(
+    record: dict,
+    loc_prompts: list[str],
+    rw: dict | str | None,
+) -> tuple[list[str] | None, str | None]:
+    """
+    Decide neighborhood ``ground_truth`` labels (parallel to ``loc_prompts``).
+
+    Returns ``(truths, source_tag)`` where ``source_tag`` is one of:
+    ``parallel_record_field``, ``locality_ground_truth_list``,
+    ``locality_ground_truth_scalar_broadcast``, ``requested_rewrite_target_true_broadcast``,
+    or ``missing`` if no labels can be resolved.
+    """
+    n_nb = len(loc_prompts)
+    for key in ("neighborhood_ground_truths", "neighborhood_targets", "neighborhood_answers"):
+        raw = record.get(key)
+        if isinstance(raw, (list, tuple)) and n_nb > 0 and len(raw) >= n_nb:
+            return [_coerce_text(x) for x in raw[:n_nb]], "parallel_record_field"
+
+    top_lg = record.get("locality_ground_truth")
+    if isinstance(top_lg, (list, tuple)) and n_nb > 0 and len(top_lg) >= n_nb:
+        return [_coerce_text(x) for x in top_lg[:n_nb]], "locality_ground_truth_list"
+    if top_lg is not None:
+        return [_coerce_text(top_lg)] * n_nb, "locality_ground_truth_scalar_broadcast"
+
+    tt = None
+    if rw and isinstance(rw, dict):
+        tt = rw.get("target_true") or rw.get("ground_truth")
+    if tt is not None:
+        if isinstance(tt, dict) and "str" in tt:
+            tt = tt["str"]
+        tt_text = _coerce_text(tt)
+        return [tt_text] * n_nb, "requested_rewrite_target_true_broadcast"
+
+    return None, "missing"
+
+
+def raw_neighborhood_prompt_count(record: dict) -> int:
+    """
+    Number of neighborhood locality prompts in ``record`` before ``max_nb_prompts``
+    truncation (CounterFact: ``neighborhood_prompts`` or ``locality_prompt``).
+    """
+    loc_prompt = record.get("locality_prompt")
+    if loc_prompt is None and "neighborhood_prompts" in record:
+        nprompts = record.get("neighborhood_prompts")
+        if isinstance(nprompts, (list, tuple)) and nprompts:
+            return len(nprompts)
+    if loc_prompt is None:
+        return 0
+    if isinstance(loc_prompt, (list, tuple)):
+        return len(loc_prompt)
+    return 1
+
+
+def neighborhood_prompt_count_stats(
+    records: list[dict],
+    *,
+    max_nb_prompts: int = 10,
+) -> dict[str, Any]:
+    """
+    Min / mean / max neighborhood prompt counts: raw dataset vs after ``max_nb_prompts`` cap.
+    Only includes records that have at least one neighborhood prompt.
+    """
+    raw_counts: list[int] = []
+    eval_counts: list[int] = []
+    for r in records:
+        c = raw_neighborhood_prompt_count(r)
+        if c <= 0:
+            continue
+        raw_counts.append(c)
+        cap = max_nb_prompts if max_nb_prompts > 0 else c
+        eval_counts.append(min(c, cap))
+    if not raw_counts:
+        return {
+            "n_records_with_neighborhood": 0,
+            "raw_min": 0,
+            "raw_mean": 0.0,
+            "raw_max": 0,
+            "after_cap_min": 0,
+            "after_cap_mean": 0.0,
+            "after_cap_max": 0,
+            "max_nb_prompts_cap": max_nb_prompts,
+        }
+    arr_raw = np.array(raw_counts, dtype=np.float64)
+    arr_ev = np.array(eval_counts, dtype=np.float64)
+    return {
+        "n_records_with_neighborhood": len(raw_counts),
+        "raw_min": int(arr_raw.min()),
+        "raw_mean": float(arr_raw.mean()),
+        "raw_max": int(arr_raw.max()),
+        "after_cap_min": int(arr_ev.min()),
+        "after_cap_mean": float(arr_ev.mean()),
+        "after_cap_max": int(arr_ev.max()),
+        "max_nb_prompts_cap": max_nb_prompts,
+    }
+
+
+def record_to_request(record: dict, *, max_nb_prompts: int = 10) -> dict:
     """Convert a CounterFact-style record to EasyEdit editor request format (with locality dict).
 
     This function is robust to slight schema differences between CounterFact
     dumps. It prefers top-level `prompt` / `target_new` / `ground_truth`
     fields, but will fall back to common nested structures (e.g. the
     `requested_rewrite` dict used in some variants) when those are absent.
+
+    :param max_nb_prompts: Cap on neighborhood locality prompts (first *N* from the list).
+        Default ``10`` matches typical CounterFact list length; use a larger value to disable
+        effectively. If ``<= 0``, no cap is applied (all prompts retained).
     """
     # Primary, flat schema (EasyEdit expects these keys for evaluation):
     # - prompt, target_new, ground_truth
@@ -205,7 +331,6 @@ def record_to_request(record: dict) -> dict:
     subject = record.get("subject")
     rephrase = record.get("rephrase_prompt")
     loc_prompt = record.get("locality_prompt")
-    loc_ground = record.get("locality_ground_truth")
 
     # Fallback: nested requested_rewrite-style schema
     rw = record.get("requested_rewrite") or record.get("edit", {}).get("requested_rewrite")
@@ -231,19 +356,20 @@ def record_to_request(record: dict) -> dict:
     if loc_prompt is None and "neighborhood_prompts" in record:
         nprompts = record.get("neighborhood_prompts")
         if isinstance(nprompts, (list, tuple)) and nprompts:
-            # Use ALL neighborhood prompts for a more stable Locality estimate.
+            # Full list from CounterFact; optional cap below for EasyEdit cost / comparability.
             loc_prompt = list(nprompts)
+
+    if (
+        loc_prompt is not None
+        and isinstance(loc_prompt, (list, tuple))
+        and max_nb_prompts > 0
+    ):
+        loc_prompt = list(loc_prompt)[:max_nb_prompts]
 
     if isinstance(target_new, dict) and "str" in target_new:
         target_new = target_new["str"]
     if isinstance(ground_truth, dict) and "str" in ground_truth:
         ground_truth = ground_truth["str"]
-    if loc_ground is None and rw and isinstance(rw, dict):
-        # For CounterFact, neighborhood prompts are usually same-relation questions,
-        # so the correct answer is the original (target_true).
-        tt = rw.get("target_true") or rw.get("ground_truth")
-        if isinstance(tt, dict) and "str" in tt:
-            loc_ground = tt["str"]
 
     if prompt is None or target_new is None:
         raise KeyError(
@@ -271,20 +397,37 @@ def record_to_request(record: dict) -> dict:
         prompt = prompt.replace("{}", subject)
 
     locality: dict[str, Any] = {}
-    if loc_prompt is not None and loc_ground is not None:
-        # Allow list-valued locality prompts/ground truths; EasyEdit supports lists.
+    if loc_prompt is not None:
         if isinstance(loc_prompt, (list, tuple)):
-            loc_prompts = [_coerce_text(p).replace("{}", subject) if "{}" in _coerce_text(p) else _coerce_text(p) for p in loc_prompt]
+            loc_prompts = [
+                _coerce_text(p).replace("{}", subject) if "{}" in _coerce_text(p) else _coerce_text(p)
+                for p in loc_prompt
+            ]
         else:
-            loc_prompts = _coerce_text(loc_prompt).replace("{}", subject) if "{}" in _coerce_text(loc_prompt) else _coerce_text(loc_prompt)
-        if isinstance(loc_prompts, list):
-            loc_ground_truths = [_coerce_text(loc_ground)] * len(loc_prompts)
-        else:
-            loc_ground_truths = _coerce_text(loc_ground)
-        locality["neighborhood"] = {
-            "prompt": loc_prompts,
-            "ground_truth": loc_ground_truths,
-        }
+            one = _coerce_text(loc_prompt)
+            loc_prompts = [one.replace("{}", subject) if "{}" in one else one]
+
+        loc_ground_truths, nb_src = resolve_neighborhood_ground_truths(record, loc_prompts, rw)
+        if nb_src == "requested_rewrite_target_true_broadcast":
+            tt_text = loc_ground_truths[0] if loc_ground_truths else ""
+            case_id = record.get("case_id")
+            cid = f"case_id={case_id}" if case_id is not None else f"keys={list(record.keys())}"
+            logger.warning(
+                "%s: neighborhood locality uses `requested_rewrite.target_true` (%r) for all "
+                "%d neighborhood prompts. azhx/counterfact has no per-prompt neighborhood "
+                "answers in the schema (only `neighborhood_prompts`); neighbors refer to other "
+                "subjects and may have different correct objects. Supply "
+                "`neighborhood_ground_truths` (list, same length as prompts) if you have them.",
+                cid,
+                tt_text,
+                len(loc_prompts),
+            )
+
+        if loc_ground_truths is not None:
+            locality["neighborhood"] = {
+                "prompt": loc_prompts,
+                "ground_truth": loc_ground_truths,
+            }
 
     req: dict[str, Any] = {
         "prompt": prompt,
@@ -305,6 +448,15 @@ def record_to_request(record: dict) -> dict:
         else:
             rp = _coerce_text(rephrase)
             req["rephrase_prompt"] = rp.replace("{}", subject) if "{}" in rp else rp
+
+    # generation_prompts: for Fluency (GE) - n-gram entropy of edited model's generations
+    if "generation_prompts" in record:
+        gp = record.get("generation_prompts")
+        if isinstance(gp, (list, tuple)) and gp:
+            req["generation_prompts"] = [
+                _coerce_text(p).replace("{}", subject) if "{}" in _coerce_text(p) else _coerce_text(p)
+                for p in gp
+            ]
 
     return req
 
